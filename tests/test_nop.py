@@ -1,4 +1,7 @@
+import subprocess
+import sys
 import unittest
+from pathlib import Path
 
 from maspsx import MaspsxProcessor
 
@@ -776,3 +779,177 @@ class TestNopMacro(unittest.TestCase):
         res = mp.process_lines()
         clean_lines = strip_comments(res)
         self.assertEqual(expected_lines, clean_lines)
+
+
+class TestSizedExternNop(unittest.TestCase):
+    """Minimal TM4 reductions with invented symbols/offsets; no game data needed."""
+
+    def translate(
+        self,
+        body,
+        declarations=(".extern head,4",),
+        limit=8,
+        preserve_gp=True,
+        version="2.79",
+    ):
+        source = "\n".join([*declarations, ".text", ".set noreorder", *body]) + "\n"
+        command = [
+            sys.executable,
+            str(Path(__file__).resolve().parents[1] / "maspsx.py"),
+            "--force-stdin",
+            "--aspsx-version=" + version,
+            "-G" + str(limit),
+        ]
+        if preserve_gp:
+            command.append("--dont-force-G0")
+        result = subprocess.run(
+            command,
+            input=source,
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=True,
+        )
+        return [
+            line
+            for line in strip_comments(result.stdout.splitlines())
+            if line and not line.startswith(".")
+        ]
+
+    def test_unlink_loaded_pointer_to_external_head(self):
+        # Unlink reduction: #nop is a comment, so the GP store needs a real NOP.
+        body = ["lw\t$2,0($4)", "#nop", "sw\t$2,head"]
+        self.assertEqual(self.translate(body), [body[0], "nop", body[2]])
+
+    def test_worker_loaded_cursor_to_distinct_extern(self):
+        # Worker reduction: advance a cursor using the same base/destination.
+        body = ["lw\t$3,4($3)", "#nop", "sw\t$3,cursor"]
+        self.assertEqual(
+            self.translate(body, (".extern cursor,4",)), [body[0], "nop", body[2]]
+        )
+
+    def test_cleanup_two_cursor_updates(self):
+        # Plain cleanup reduction: each separated update needs its own delay.
+        body = [
+            "lw\t$2,0($4)",
+            "#nop",
+            "sw\t$2,cursor",
+            "lw\t$3,4($4)",
+            "#nop",
+            "sw\t$3,cursor",
+        ]
+        self.assertEqual(
+            self.translate(body, (".extern cursor,4",)),
+            [body[0], "nop", body[2], body[3], "nop", body[5]],
+        )
+
+    def test_small_extern_sizes_and_offsets(self):
+        for declaration, operand in [
+            (".extern head,8", "head"),
+            (".extern head,0x4", "head"),
+            (".extern head,4", "head+4"),
+            (".extern head,4", "head-4"),
+            (".extern head,4", "head+0x4"),
+        ]:
+            with self.subTest(declaration=declaration, operand=operand):
+                body = ["lw\t$2,0($4)", "#nop", "sw\t$2," + operand]
+                self.assertEqual(
+                    self.translate(body, (declaration,)), [body[0], "nop", body[2]]
+                )
+
+    def test_halfword_load_to_external_store(self):
+        body = ["lh\t$2,0($4)", "#nop", "sw\t$2,head"]
+        self.assertEqual(self.translate(body), [body[0], "nop", body[2]])
+
+    def test_non_small_or_unsized_extern(self):
+        body = ["lw\t$2,0($4)", "#nop", "sw\t$2,head"]
+        for declaration in (".extern head,9", ".extern head,0", ".extern head"):
+            with self.subTest(declaration=declaration):
+                self.assertEqual(
+                    self.translate(body, (declaration,)), [body[0], body[2]]
+                )
+
+    def test_explicit_G0(self):
+        body = ["lw\t$2,0($4)", "#nop", "sw\t$2,head"]
+        self.assertEqual(self.translate(body, limit=0), [body[0], body[2]])
+
+    def test_default_forced_G0(self):
+        body = ["lw\t$2,0($4)", "#nop", "sw\t$2,head"]
+        self.assertEqual(self.translate(body, preserve_gp=False), [body[0], body[2]])
+
+    def test_gp_disabled_version(self):
+        # This version independently requires a NOP before AT macros, even at G0.
+        body = ["lw\t$2,0($4)", "#nop", "sw\t$2,head"]
+        self.assertEqual(
+            self.translate(body, version="2.07"),
+            self.translate(body, limit=0, version="2.07"),
+        )
+
+    def test_explicit_base_supplies_AT_delay(self):
+        body = ["lw\t$2,0($4)", "#nop", "sw\t$2,head($5)"]
+        result = self.translate(body)
+        self.assertNotIn("nop", result)
+        self.assertEqual(result, self.translate(body, limit=0))
+
+    def test_large_offsets_supply_AT_delay(self):
+        for operand in ("head+32768", "head-32769"):
+            with self.subTest(operand=operand):
+                body = ["lw\t$2,0($4)", "#nop", "sw\t$2," + operand]
+                # Negative expressions already get a conservative NOP from
+                # uses_at(); preserve that existing behavior, independent of GP.
+                self.assertEqual(self.translate(body), self.translate(body, limit=0))
+                if operand == "head+32768":
+                    self.assertEqual(self.translate(body), [body[0], body[2]])
+
+    def test_store_consumes_different_register(self):
+        body = ["lw\t$2,0($4)", "#nop", "sw\t$3,head"]
+        self.assertEqual(self.translate(body), [body[0], body[2]])
+
+    def test_independent_instruction_already_fills_delay(self):
+        body = ["lw\t$2,0($4)", "addu\t$5,$6,$7", "sw\t$2,head"]
+        self.assertEqual(self.translate(body), body)
+
+    def test_explicit_NOP_is_not_duplicated(self):
+        body = ["lw\t$2,0($4)", "nop", "sw\t$2,head"]
+        self.assertEqual(self.translate(body), body)
+
+    def test_gnu_integer_bases_in_offsets(self):
+        # 040000 is octal 16384 (direct GP), not decimal 40000 (AT macro).
+        for amount in ("04", "010", "040000", "0X4", "0b100", "0B100", "0x", "0X"):
+            with self.subTest(amount=amount):
+                body = ["lw\t$2,0($4)", "#nop", "sw\t$2,head+" + amount]
+                self.assertEqual(self.translate(body), [body[0], "nop", body[2]])
+        # Octal 0100000 is 32768, outside the direct GP immediate range.
+        body = ["lw\t$2,0($4)", "#nop", "sw\t$2,head+0100000"]
+        self.assertEqual(self.translate(body), [body[0], body[2]])
+
+    def test_gnu_integer_bases_in_extern_sizes(self):
+        # GNU treats 010 as eight bytes, exactly the configured G8 threshold.
+        body = ["lw\t$2,0($4)", "#nop", "sw\t$2,head"]
+        for size in ("04", "010", "0X4", "0b100", "0B100"):
+            with self.subTest(size=size):
+                self.assertEqual(
+                    self.translate(body, (".extern head," + size,)),
+                    [body[0], "nop", body[2]],
+                )
+        self.assertEqual(
+            self.translate(body, (".extern head,011",)), [body[0], body[2]]
+        )
+        # GNU's accepted bare hexadecimal prefix means zero, not a small object.
+        for size in ("0x", "0X"):
+            with self.subTest(size=size):
+                self.assertEqual(
+                    self.translate(body, (".extern head," + size,)), [body[0], body[2]]
+                )
+
+    def test_unsupported_integer_tokens_do_not_crash(self):
+        # Invalid octal and Python-only 0o prefixes are left for GNU diagnostics.
+        for token in ("08", "0o4", "0b", "0B", "0b2"):
+            with self.subTest(token=token):
+                body = ["lw\t$2,0($4)", "#nop", "sw\t$2,head+" + token]
+                self.assertEqual(self.translate(body), [body[0], body[2]])
+                plain = ["lw\t$2,0($4)", "#nop", "sw\t$2,head"]
+                self.assertEqual(
+                    self.translate(plain, (".extern head," + token,)),
+                    [plain[0], plain[2]],
+                )

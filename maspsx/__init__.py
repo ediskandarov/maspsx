@@ -2,7 +2,7 @@ import struct
 import re
 
 from enum import Enum
-from typing import List
+from typing import List, Optional
 
 branch_mnemonics = {
     "beq",
@@ -461,6 +461,20 @@ class PassthroughProcessor:
         return res
 
 
+def _parse_gnu_integer(text: str) -> Optional[int]:
+    """Parse an unsigned GNU integer token, not a general assembler expression."""
+    if re.fullmatch(r"0[xX][0-9a-fA-F]*", text):
+        # GNU as also accepts the bare hexadecimal prefix as zero.
+        return int(text[2:] or "0", 16)
+    if re.fullmatch(r"0[bB][01]+", text):
+        return int(text[2:], 2)
+    if re.fullmatch(r"0[0-7]*", text):
+        return int(text, 8)
+    if re.fullmatch(r"[1-9][0-9]*", text):
+        return int(text, 10)
+    return None
+
+
 class MaspsxProcessor:
     is_reorder = True
     skip_instructions = 0
@@ -487,10 +501,13 @@ class MaspsxProcessor:
         lcomm_alignment=LcommAlignment.WORD,
         comm_uses_sdata_limit=True,
         gp_allow=True,
+        extern_sdata_limit=0,
     ):
         self.lines = [x.strip() for x in lines]
 
         self.sdata_limit = sdata_limit
+        # GNU alone chooses GP macros for externs when its -G setting is retained.
+        self.extern_sdata_limit = extern_sdata_limit
 
         self.expand_div = expand_div
         self.expand_li = expand_li
@@ -516,6 +533,8 @@ class MaspsxProcessor:
         self.bss_entries: dict[str, int] = {}
         self.sbss_entries: dict[str, int] = {}
         self.sdata_entries: dict[str, int] = {}
+
+        self.extern_entries: dict[str, int] = {}
 
         self.comm_symbols: set[str] = set()
 
@@ -561,6 +580,16 @@ class MaspsxProcessor:
 
             if line.startswith(".extern"):
                 in_sdata = False
+                match = re.fullmatch(
+                    r"\.extern\s+([^,\s]+)\s*,\s*(\S+)\s*",
+                    strip_comments(line),
+                )
+                if match:
+                    symbol, size_text = match.groups()
+                    size = _parse_gnu_integer(size_text)
+                    self.extern_entries.pop(symbol, None)
+                    if size is not None and 0 < size <= self.extern_sdata_limit:
+                        self.extern_entries[symbol] = size
                 continue
 
             if line.startswith(".comm") or line.startswith(".lcomm"):
@@ -624,6 +653,7 @@ class MaspsxProcessor:
         self.bss_entries = {}
         self.sbss_entries = {}
         self.sdata_entries = {}
+        self.extern_entries = {}
 
         self.preprocess_lines()
 
@@ -716,7 +746,7 @@ class MaspsxProcessor:
             op, *rest = line.split("\t")
             if op in load_mnemonics or op in store_mnemonics:
                 (
-                    _,
+                    r_source,
                     _,
                     operand,
                     _,
@@ -734,6 +764,22 @@ class MaspsxProcessor:
                     symbol in self.sbss_entries or symbol in self.sdata_entries
                 ):
                     return True
+                # Do not rewrite extern references: GNU's retained -G setting
+                # selects the macro. Only model its direct, base-free GP access.
+                if r_source is None:
+                    match = re.fullmatch(
+                        r"([^+\-\s]+)(?:([+-])([^\s]+))?",
+                        operand,
+                    )
+                    if match and match.group(1) in self.extern_entries:
+                        _, sign, amount = match.groups()
+                        offset = _parse_gnu_integer(amount) if amount else 0
+                        if offset is None:
+                            return False
+                        if sign == "-":
+                            offset = -offset
+                        if -32768 <= offset <= 32767:
+                            return True
 
         return False
 

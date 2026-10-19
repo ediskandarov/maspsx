@@ -156,6 +156,7 @@ def main() -> None:
         processor = MaspsxProcessor(
             in_lines,
             sdata_limit=sdata_limit,
+            extern_sdata_limit=0 if force_G0 else sdata_limit,
             expand_div=args.expand_div,
             expand_li=version_config.expand_li,
             nop_at_expansion=version_config.nop_at_expansion,
